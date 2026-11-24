@@ -13,6 +13,113 @@ using System.Threading;
 using System.Threading.Tasks;
 
 namespace Microsoft.Scripting.Runtime {
+    public sealed class AsyncSuspensionCoordinator {
+        private static readonly ConditionalWeakTable<Task, object> YieldTasks = new();
+        private static readonly object YieldMarker = new();
+        private readonly object _sync = new();
+        private Task? _awaiting;
+        private ResumeAwaiter? _resume;
+        private bool _enabled = true;
+        private int _sawAwait;
+        private int _sawBareYield;
+
+        public bool IsEnabled => Volatile.Read(ref _enabled);
+        public bool SawAwait => Volatile.Read(ref _sawAwait) != 0;
+        public bool SawBareYield => Volatile.Read(ref _sawBareYield) != 0;
+
+        public void Disable() => Volatile.Write(ref _enabled, false);
+
+        public bool ObserveAwait(Task task) {
+            Volatile.Write(ref _sawAwait, 1);
+            if (IsYield(task)) Volatile.Write(ref _sawBareYield, 1);
+            return !task.IsCompleted;
+        }
+
+        public static void MarkYield(Task task) => YieldTasks.AddOrUpdate(task, YieldMarker);
+
+        public static bool IsYield(Task task) => YieldTasks.TryGetValue(task, out _);
+
+        internal ResumeAwaiter WaitForResume(Task awaited) {
+            var resume = new ResumeAwaiter();
+            lock (_sync) {
+                _awaiting = awaited;
+                _resume = resume;
+                Monitor.PulseAll(_sync);
+            }
+            return resume;
+        }
+
+        public bool TryGetAwait([System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out Task? awaited) {
+            lock (_sync) {
+                awaited = _awaiting;
+                return awaited is not null;
+            }
+        }
+
+        public bool Resume() {
+            ResumeAwaiter? resume;
+            lock (_sync) {
+                resume = _resume;
+                _resume = null;
+                _awaiting = null;
+            }
+            resume?.Complete();
+            return resume is not null;
+        }
+
+        public void ResumeAndWait(Task task) {
+            ResumeAwaiter? resume;
+            lock (_sync) {
+                resume = _resume;
+                _resume = null;
+                _awaiting = null;
+            }
+            resume?.Complete();
+            lock (_sync) {
+                while (_awaiting is null && !task.IsCompleted) {
+                    Monitor.Wait(_sync, 100);
+                }
+            }
+        }
+
+        public void NotifyCompleted() {
+            lock (_sync) {
+                Monitor.PulseAll(_sync);
+            }
+        }
+
+        internal sealed class ResumeAwaiter : INotifyCompletion {
+            private Action? _continuation;
+            private bool _completed;
+
+            public bool IsCompleted => false;
+
+            public ResumeAwaiter GetAwaiter() => this;
+
+            public void OnCompleted(Action continuation) {
+                bool run;
+                lock (this) {
+                    run = _completed;
+                    if (!run) _continuation = continuation;
+                }
+                if (run) continuation();
+            }
+
+            public void GetResult() { }
+
+            public void Complete() {
+                Action? continuation;
+                lock (this) {
+                    if (_completed) return;
+                    _completed = true;
+                    continuation = _continuation;
+                    _continuation = null;
+                }
+                continuation?.Invoke();
+            }
+        }
+    }
+
     /// <summary>
     ///   Runtime-async orchestrator for <see cref="Microsoft.Scripting.Ast.AsyncExpression"/>.
     /// </summary>
@@ -80,7 +187,8 @@ namespace Microsoft.Scripting.Runtime {
                                                      StrongBox<Exception?> exceptionSlot,
                                                      AsyncInterruptSource? interrupts,
                                                      IObserver<AsyncBodyEvent>? observer,
-                                                     CancellationToken cancellationToken) {
+                                                     CancellationToken cancellationToken,
+                                                     AsyncSuspensionCoordinator? coordinator = null) {
 
             if (interrupts?.Start(cancellationToken) is Exception early) {
                 observer?.OnError(early);
@@ -116,6 +224,10 @@ namespace Microsoft.Scripting.Runtime {
                     }
 
                     if (item is Task task) {
+                        if (coordinator is not null && coordinator.ObserveAwait(task) &&
+                            coordinator.IsEnabled) {
+                            await coordinator.WaitForResume(task);
+                        }
                         // The interrupt source's token is cancelled by an interrupt as well as by cancellationToken.
                         bool interruptible = interrupts is not null && !task.IsCompleted;
                         CancellationToken token = interruptible ? interrupts!.GetToken() : cancellationToken;

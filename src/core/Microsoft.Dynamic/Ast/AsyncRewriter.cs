@@ -103,7 +103,8 @@ namespace Microsoft.Scripting.Ast {
                 exceptionSlot,
                 _node.Interrupts,
                 _node.Observer,
-                _node.CancellationToken);
+                _node.CancellationToken,
+                _node.Coordinator);
 
             return Expression.Block(
                 typeof(Task<object?>),

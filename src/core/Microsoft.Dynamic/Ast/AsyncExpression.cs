@@ -45,12 +45,14 @@ namespace Microsoft.Scripting.Ast {
                                   Expression? cancellationToken = null,
                                   DebugContext? debugContext = null,
                                   DebugLambdaInfo? debugLambdaInfo = null,
-                                  ReadOnlyCollection<ParameterExpression>? debugVariables = null) {
+                                  ReadOnlyCollection<ParameterExpression>? debugVariables = null,
+                                  Expression? coordinator = null) {
             Name = name;
             Body = body;
             Interrupts = interrupts ?? Utils.DefaultInterrupts;
             Observer = observer ?? Utils.DefaultObserver;
             CancellationToken = cancellationToken ?? Utils.DefaultCancellationToken;
+            Coordinator = coordinator ?? Expression.Constant(null, typeof(AsyncSuspensionCoordinator));
             DebugContext = debugContext;
             DebugLambdaInfo = debugLambdaInfo;
             DebugVariables = debugVariables ?? ReadOnlyCollection<ParameterExpression>.Empty;
@@ -101,13 +103,15 @@ namespace Microsoft.Scripting.Ast {
             ContractUtils.RequiresNotNull(variables, nameof(variables));
             ReadOnlyCollection<ParameterExpression> debugVariables = variables.ToReadOnlyCollection();
             ContractUtils.RequiresNotNullItems(debugVariables, nameof(variables));
-            return new AsyncExpression(Name, Body, Interrupts, Observer, CancellationToken, debugContext, debugLambdaInfo, debugVariables);
+            return new AsyncExpression(Name, Body, Interrupts, Observer, CancellationToken, debugContext, debugLambdaInfo, debugVariables, Coordinator);
         }
 
         /// <summary>
         ///   The observer expression set by <see cref="WithObserver"/>; defaults to a null constant.
         /// </summary>
         internal Expression Observer { get; }
+
+        internal Expression Coordinator { get; }
 
         /// <summary>
         ///   Returns a copy of this node that notifies an observer as the body runs: when it starts, suspends, resumes and returns,
@@ -122,7 +126,7 @@ namespace Microsoft.Scripting.Ast {
             ContractUtils.RequiresNotNull(observer, nameof(observer));
             ContractUtils.RequiresReferenceAssignable(observer, typeof(IObserver<AsyncBodyEvent>), nameof(observer));
             if (Utils.HasObserver(Observer)) throw new InvalidOperationException("The async expression already has an observer.");
-            return new AsyncExpression(Name, Body, Interrupts, observer, CancellationToken, DebugContext, DebugLambdaInfo, DebugVariables);
+            return new AsyncExpression(Name, Body, Interrupts, observer, CancellationToken, DebugContext, DebugLambdaInfo, DebugVariables, Coordinator);
         }
 
         /// <summary>
@@ -162,9 +166,10 @@ namespace Microsoft.Scripting.Ast {
             Expression i = visitor.Visit(Interrupts);
             Expression o = visitor.Visit(Observer);
             Expression ct = visitor.Visit(CancellationToken);
+            Expression coordinator = visitor.Visit(Coordinator);
             ReadOnlyCollection<ParameterExpression> v = visitor.VisitAndConvert(DebugVariables, nameof(VisitChildren));
-            if (b == Body && i == Interrupts && o == Observer && ct == CancellationToken && v == DebugVariables) return this;
-            return new AsyncExpression(Name, b, i, o, ct, DebugContext, DebugLambdaInfo, v);
+            if (b == Body && i == Interrupts && o == Observer && ct == CancellationToken && coordinator == Coordinator && v == DebugVariables) return this;
+            return new AsyncExpression(Name, b, i, o, ct, DebugContext, DebugLambdaInfo, v, coordinator);
         }
     }
 
@@ -195,7 +200,8 @@ namespace Microsoft.Scripting.Ast {
         /// </remarks>
         public static AsyncExpression Async(string? name, Expression body,
                                             Expression? interrupts,
-                                            Expression? cancellationToken = null) {
+                                            Expression? cancellationToken = null,
+                                            Expression? coordinator = null) {
             ContractUtils.RequiresNotNull(body, nameof(body));
             if (interrupts is not null) {
                 ContractUtils.RequiresType(interrupts, typeof(AsyncInterruptSource), nameof(interrupts));
@@ -203,7 +209,10 @@ namespace Microsoft.Scripting.Ast {
             if (cancellationToken is not null) {
                 ContractUtils.RequiresType(cancellationToken, typeof(CancellationToken), nameof(cancellationToken));
             }
-            return new AsyncExpression(name, body, interrupts, cancellationToken: cancellationToken);
+            if (coordinator is not null) {
+                ContractUtils.RequiresType(coordinator, typeof(AsyncSuspensionCoordinator), nameof(coordinator));
+            }
+            return new AsyncExpression(name, body, interrupts, cancellationToken: cancellationToken, coordinator: coordinator);
         }
     }
 }
