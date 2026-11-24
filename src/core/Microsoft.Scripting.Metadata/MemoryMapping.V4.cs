@@ -66,7 +66,6 @@ namespace Microsoft.Scripting.Metadata {
                 mapping = new MemoryMapping();
 
                 // we need to make sure that the handle and the acquired pointer get stored to MemoryMapping:
-                RuntimeHelpers.PrepareConstrainedRegions();
                 try { } finally {
                     handle = accessor.SafeMemoryMappedViewHandle;
                     handle.AcquirePointer(ref ptr);

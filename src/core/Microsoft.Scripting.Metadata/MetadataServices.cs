@@ -17,7 +17,7 @@ namespace Microsoft.Scripting.Metadata {
             _metadataCache ??= new Dictionary<Assembly, MetadataTables[]>();
 
             lock (_metadataCache) {
-                if (!_metadataCache.TryGetValue(assembly, out MetadataTables[] metadata)) {
+                if (!_metadataCache.TryGetValue(assembly, out MetadataTables[]? metadata)) {
                     var modules = assembly.GetModules(false);
                     metadata = new MetadataTables[modules.Length];
                     int i = 1;
@@ -32,7 +32,7 @@ namespace Microsoft.Scripting.Metadata {
                     
                     _metadataCache.Add(assembly, metadata);
                 }
-                return metadata;
+                return metadata!;
             }
         }
 
@@ -113,7 +113,9 @@ namespace Microsoft.Scripting.Metadata {
             
             List<MethodInfo> result = new List<MethodInfo>(tokens.Count);
             foreach (var moduleAndToken in tokens) {
-                result.Add((MethodInfo)moduleAndToken.Key.ResolveMethod(moduleAndToken.Value));
+                if (moduleAndToken.Key.ResolveMethod(moduleAndToken.Value) is MethodInfo method) {
+                    result.Add(method);
+                }
             }
             return result;
         }
