@@ -1388,7 +1388,8 @@ namespace Microsoft.Scripting.Interpreter {
             if (expr.CanReduce) {
                 Compile(expr.Reduce());
             } else {
-                throw new System.NotImplementedException();
+                throw new System.NotImplementedException(
+                    $"Expression {expr.GetType().FullName} ({expr.NodeType}) cannot reduce.");
             }
         }
 
