@@ -20,6 +20,8 @@ namespace Microsoft.Scripting.Runtime {
         private Task? _awaiting;
         private ResumeAwaiter? _resume;
         private TaskCompletionSource<object?>? _yieldGate;
+        private object? _producedYield;
+        private bool _hasProducedYield;
         private bool _enabled = true;
         private int _sawAwait;
         private int _sawBareYield;
@@ -89,6 +91,10 @@ namespace Microsoft.Scripting.Runtime {
         }
 
         public void ResumeAndWait(Task task) {
+            ResumeAndWait(task, null);
+        }
+
+        public void ResumeAndWait(Task task, object? value) {
             ResumeAwaiter? resume;
             TaskCompletionSource<object?>? yieldGate;
             lock (_sync) {
@@ -99,7 +105,7 @@ namespace Microsoft.Scripting.Runtime {
                 _yieldGate = null;
             }
             resume?.Complete();
-            yieldGate?.TrySetResult(null);
+            yieldGate?.TrySetResult(value);
             lock (_sync) {
                 while (_awaiting is null && !task.IsCompleted) {
                     Monitor.Wait(_sync, 100);
@@ -108,11 +114,32 @@ namespace Microsoft.Scripting.Runtime {
         }
 
         public Task WaitForBareYield() {
+            return WaitForYield(null);
+        }
+
+        public Task<object?> WaitForYield(object? value) {
             var gate = new TaskCompletionSource<object?>();
             lock (_sync) {
                 _yieldGate = gate;
+                _awaiting = gate.Task;
+                _producedYield = value;
+                _hasProducedYield = true;
+                Monitor.PulseAll(_sync);
             }
             return gate.Task;
+        }
+
+        public bool TryConsumeYield(out object? value) {
+            lock (_sync) {
+                if (!_hasProducedYield) {
+                    value = null;
+                    return false;
+                }
+                value = _producedYield;
+                _producedYield = null;
+                _hasProducedYield = false;
+                return true;
+            }
         }
 
         public void NotifyCompleted() {
