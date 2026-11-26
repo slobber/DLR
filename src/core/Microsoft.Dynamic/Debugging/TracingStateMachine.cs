@@ -67,10 +67,13 @@ namespace Microsoft.Scripting.Debugging {
         /// <param name="variables">The storage of the body's variables, which the frame exposes.</param>
         internal TracingStateMachine(IEnumerator<object?> states, DebugContext debugContext, FunctionInfo functionInfo,
                                      StrongBox<object?>? resultSlot, StrongBox<Exception?> exceptionSlot, bool isAsyncEnumerable,
-                                     IRuntimeVariables variables) {
+                                     Action<object>[] variableSetters, IRuntimeVariables variables) {
             _states = states;
             _debugContext = debugContext;
-            _variables = new FrameRuntimeVariables(functionInfo, variables);
+            _variables = new FrameRuntimeVariables(
+                functionInfo,
+                variableSetters,
+                variables);
             _resultSlot = resultSlot;
             _exceptionSlot = exceptionSlot;
             _isAsyncEnumerable = isAsyncEnumerable;
@@ -204,10 +207,15 @@ namespace Microsoft.Scripting.Debugging {
         /// </remarks>
         private sealed class FrameRuntimeVariables : IRuntimeVariables {
             private readonly FunctionInfo _functionInfo;
+            private readonly Action<object>[] _setters;
             private readonly IRuntimeVariables _variables;
 
-            internal FrameRuntimeVariables(FunctionInfo functionInfo, IRuntimeVariables variables) {
+            internal FrameRuntimeVariables(
+                FunctionInfo functionInfo,
+                Action<object>[] setters,
+                IRuntimeVariables variables) {
                 _functionInfo = functionInfo;
+                _setters = setters;
                 _variables = variables;
             }
 
@@ -225,7 +233,7 @@ namespace Microsoft.Scripting.Debugging {
                     if (index == 1) {
                         Marker = (int)value!;
                     } else if (index > 1) {
-                        _variables[index - 2] = value;
+                        _setters[index - 2](value!);
                     }
                 }
             }

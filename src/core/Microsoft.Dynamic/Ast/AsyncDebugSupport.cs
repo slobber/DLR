@@ -8,6 +8,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Globalization;
+using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Runtime.CompilerServices;
@@ -47,7 +48,7 @@ namespace Microsoft.Scripting.Ast {
             = typeof(TracingStateMachine).GetConstructor(
                 BindingFlags.Instance | BindingFlags.NonPublic, binder: null,
                 [typeof(IEnumerator<object?>), typeof(DebugContext), typeof(FunctionInfo), typeof(StrongBox<object?>), typeof(StrongBox<Exception?>),
-                 typeof(bool), typeof(IRuntimeVariables)],
+                 typeof(bool), typeof(Action<object>[]), typeof(IRuntimeVariables)],
                 modifiers: null)!;
         private static readonly MethodInfo s_onExceptionCaughtMethod
             = typeof(TracingStateMachine).GetMethod(nameof(TracingStateMachine.OnExceptionCaught), BindingFlags.Instance | BindingFlags.NonPublic)!;
@@ -146,7 +147,21 @@ namespace Microsoft.Scripting.Ast {
                         (Expression?)resultSlot ?? Expression.Constant(null, typeof(StrongBox<object?>)),
                         _exceptionSlot,
                         Expression.Constant(isAsyncEnumerable),
+                        CreateVariableSetters(),
                         Expression.RuntimeVariables(_variables))));
+        }
+
+        private Expression CreateVariableSetters() {
+            return Expression.NewArrayInit(
+                typeof(Action<object>),
+                _variables.Select(variable => {
+                    var value = Expression.Parameter(typeof(object), "value");
+                    return Expression.Lambda<Action<object>>(
+                        Expression.Assign(
+                            variable,
+                            Expression.Convert(value, variable.Type)),
+                        value);
+                }));
         }
 
 

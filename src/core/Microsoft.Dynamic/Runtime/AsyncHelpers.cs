@@ -19,6 +19,7 @@ namespace Microsoft.Scripting.Runtime {
         private readonly object _sync = new();
         private Task? _awaiting;
         private ResumeAwaiter? _resume;
+        private TaskCompletionSource<object?>? _yieldGate;
         private bool _enabled = true;
         private int _sawAwait;
         private int _sawBareYield;
@@ -32,7 +33,23 @@ namespace Microsoft.Scripting.Runtime {
         public bool ObserveAwait(Task task) {
             Volatile.Write(ref _sawAwait, 1);
             if (IsYield(task)) Volatile.Write(ref _sawBareYield, 1);
-            return !task.IsCompleted;
+            bool incomplete = !task.IsCompleted;
+            // A coordinator may be disabled because the coroutine is driven by an
+            // external asyncio Task. Its current await is still needed so throw()
+            // can follow nested Python coroutine awaits before falling back to the
+            // outer state machine.
+            lock (_sync) {
+                _awaiting = incomplete ? task : null;
+            }
+            return incomplete;
+        }
+
+        public void FinishAwait(Task task) {
+            lock (_sync) {
+                if (ReferenceEquals(_awaiting, task)) {
+                    _awaiting = null;
+                }
+            }
         }
 
         public static void MarkYield(Task task) => YieldTasks.AddOrUpdate(task, YieldMarker);
@@ -58,28 +75,44 @@ namespace Microsoft.Scripting.Runtime {
 
         public bool Resume() {
             ResumeAwaiter? resume;
+            TaskCompletionSource<object?>? yieldGate;
             lock (_sync) {
                 resume = _resume;
+                yieldGate = _yieldGate;
                 _resume = null;
                 _awaiting = null;
+                _yieldGate = null;
             }
             resume?.Complete();
+            yieldGate?.TrySetResult(null);
             return resume is not null;
         }
 
         public void ResumeAndWait(Task task) {
             ResumeAwaiter? resume;
+            TaskCompletionSource<object?>? yieldGate;
             lock (_sync) {
                 resume = _resume;
+                yieldGate = _yieldGate;
                 _resume = null;
                 _awaiting = null;
+                _yieldGate = null;
             }
             resume?.Complete();
+            yieldGate?.TrySetResult(null);
             lock (_sync) {
                 while (_awaiting is null && !task.IsCompleted) {
                     Monitor.Wait(_sync, 100);
                 }
             }
+        }
+
+        public Task WaitForBareYield() {
+            var gate = new TaskCompletionSource<object?>();
+            lock (_sync) {
+                _yieldGate = gate;
+            }
+            return gate.Task;
         }
 
         public void NotifyCompleted() {
@@ -124,6 +157,16 @@ namespace Microsoft.Scripting.Runtime {
     ///   Runtime-async orchestrator for <see cref="Microsoft.Scripting.Ast.AsyncExpression"/>.
     /// </summary>
     public static class AsyncHelpers {
+        private static readonly AsyncLocal<AsyncSuspensionCoordinator?> s_currentCoordinator = new();
+
+        /// <summary>
+        /// The coordinator of the async body currently executing on this logical
+        /// flow. Used to gate generator-based coroutine bare yields until the
+        /// asyncio Task explicitly resumes the outer coroutine.
+        /// </summary>
+        public static AsyncSuspensionCoordinator? CurrentCoordinator
+            => s_currentCoordinator.Value;
+
         /// <summary>
         ///  Drives a language function body, awaiting each yielded <see cref="Task"/> and feeding the result back through <paramref
         ///  name="valueSlot"/>. Faulted awaits are routed through <paramref name="exceptionSlot"/> so the body's try/except can observe
@@ -195,6 +238,11 @@ namespace Microsoft.Scripting.Runtime {
                 ExceptionDispatchInfo.Capture(early).Throw();
             }
 
+            AsyncSuspensionCoordinator? previousCoordinator = s_currentCoordinator.Value;
+            if (coordinator is not null
+                && (previousCoordinator is null || coordinator.IsEnabled)) {
+                s_currentCoordinator.Value = coordinator;
+            }
             try {
                 observer?.OnNext(new AsyncBodyEvent(AsyncBodyEventKind.Started, null));
                 while (true) {
@@ -224,35 +272,39 @@ namespace Microsoft.Scripting.Runtime {
                     }
 
                     if (item is Task task) {
-                        if (coordinator is not null && coordinator.ObserveAwait(task) &&
-                            coordinator.IsEnabled) {
-                            await coordinator.WaitForResume(task);
-                        }
-                        // The interrupt source's token is cancelled by an interrupt as well as by cancellationToken.
-                        bool interruptible = interrupts is not null && !task.IsCompleted;
-                        CancellationToken token = interruptible ? interrupts!.GetToken() : cancellationToken;
-                        // Task.WaitAsync is BCL on net6+, polyfilled by Meziantou.Polyfill on net4x/netstandard2.0.
-                        Task waiting = task.WaitAsync(token);
-
-                        // Only an await of a task that hasn't completed gives up the thread. If the task completes before the await,
-                        // the await continues on this thread, so the observer still gets a matching pair.
-                        bool suspends = observer is not null && !waiting.IsCompleted;
-                        if (suspends) observer!.OnNext(new AsyncBodyEvent(AsyncBodyEventKind.Awaiting, task));
                         try {
-                            // No ConfigureAwait(false): honour caller's SyncContext / TaskScheduler.
-                            await waiting;
-                            valueSlot.Value = ExtractTaskResult(task);
-                            exceptionSlot.Value = null;
-                        } catch (Exception ex) {
-                            // The body's rewriter inserts a check after each yield that rethrows this on the resumed thread,
-                            // so a try/except inside `await` can catch it (including the cancellation OCE from WaitAsync).
-                            valueSlot.Value = null;
-                            exceptionSlot.Value = ex;
+                            if (coordinator is not null && coordinator.ObserveAwait(task) &&
+                                coordinator.IsEnabled) {
+                                await coordinator.WaitForResume(task);
+                            }
+                            // The interrupt source's token is cancelled by an interrupt as well as by cancellationToken.
+                            bool interruptible = interrupts is not null && !task.IsCompleted;
+                            CancellationToken token = interruptible ? interrupts!.GetToken() : cancellationToken;
+                            // Task.WaitAsync is BCL on net6+, polyfilled by Meziantou.Polyfill on net4x/netstandard2.0.
+                            Task waiting = task.WaitAsync(token);
+
+                            // Only an await of a task that hasn't completed gives up the thread. If the task completes before the await,
+                            // the await continues on this thread, so the observer still gets a matching pair.
+                            bool suspends = observer is not null && !waiting.IsCompleted;
+                            if (suspends) observer!.OnNext(new AsyncBodyEvent(AsyncBodyEventKind.Awaiting, task));
+                            try {
+                                // No ConfigureAwait(false): honour caller's SyncContext / TaskScheduler.
+                                await waiting;
+                                valueSlot.Value = ExtractTaskResult(task);
+                                exceptionSlot.Value = null;
+                            } catch (Exception ex) {
+                                // The body's rewriter inserts a check after each yield that rethrows this on the resumed thread,
+                                // so a try/except inside `await` can catch it (including the cancellation OCE from WaitAsync).
+                                valueSlot.Value = null;
+                                exceptionSlot.Value = ex;
+                            }
+                            Exception? superseded = interruptible
+                                ? ResolveInterruptibleAwait(valueSlot, exceptionSlot, interrupts!, token, cancellationToken)
+                                : null;
+                            if (suspends) observer!.OnNext(new AsyncBodyEvent(AsyncBodyEventKind.Resumed, superseded));
+                        } finally {
+                            coordinator?.FinishAwait(task);
                         }
-                        Exception? superseded = interruptible
-                            ? ResolveInterruptibleAwait(valueSlot, exceptionSlot, interrupts!, token, cancellationToken)
-                            : null;
-                        if (suspends) observer!.OnNext(new AsyncBodyEvent(AsyncBodyEventKind.Resumed, superseded));
                     } else {
                         // Synchronously-produced value forwards straight through.
                         valueSlot.Value = item;
@@ -272,6 +324,7 @@ namespace Microsoft.Scripting.Runtime {
                 }
                 observer?.OnCompleted();
             } finally {
+                s_currentCoordinator.Value = previousCoordinator;
                 interrupts?.Close();
             }
 
